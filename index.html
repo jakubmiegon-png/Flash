@@ -34,7 +34,7 @@
 <body>
   <main class="card">
     <h1>BeatFlash</h1>
-    <p class="sub">Latarka w rytm muzyki</p>
+    <p class="sub">Latarka w rytm muzyki — v2</p>
 
     <div class="status">
       <div id="beatDot" class="dot"></div>
@@ -66,7 +66,7 @@
     </div>
 
     <p class="small">
-      Najlepiej działa w Chrome na Androidzie. Telefon musi pozwalać stronie na mikrofon i tylną kamerę.
+      Wersja v2 automatycznie sprawdza wszystkie kamery i wybiera tę, która udostępnia LED. Najlepiej działa w Chrome na Androidzie. Telefon musi pozwalać stronie na mikrofon i tylną kamerę.
       Kamera jest używana tylko po to, żeby uzyskać dostęp do latarki — obraz nie jest zapisywany ani wysyłany.
     </p>
     <div class="warning">
@@ -78,187 +78,157 @@
 <script>
 (() => {
   const $ = id => document.getElementById(id);
-  const sensitivity = $('sensitivity');
-  const minInterval = $('minInterval');
-  const flashMs = $('flashMs');
-  const sensValue = $('sensValue');
-  const intervalValue = $('intervalValue');
-  const flashValue = $('flashValue');
-  const startBtn = $('startBtn');
-  const stopBtn = $('stopBtn');
-  const statusText = $('statusText');
-  const torchInfo = $('torchInfo');
-  const beatDot = $('beatDot');
-  const meterBar = $('meterBar');
+  const sensitivity=$('sensitivity'), minInterval=$('minInterval'), flashMs=$('flashMs');
+  const sensValue=$('sensValue'), intervalValue=$('intervalValue'), flashValue=$('flashValue');
+  const startBtn=$('startBtn'), stopBtn=$('stopBtn'), statusText=$('statusText'),
+        torchInfo=$('torchInfo'), beatDot=$('beatDot'), meterBar=$('meterBar');
 
-  let audioCtx, analyser, source, stream;
-  let videoTrack = null;
-  let torchSupported = false;
-  let running = false;
-  let rafId = null;
-  let lastBeat = 0;
-  let avgEnergy = 0.02;
-  let peakHold = 0;
-  let torchBusy = false;
+  let audioCtx, analyser, source, audioStream, cameraStream, videoTrack;
+  let running=false, rafId=null, lastBeat=0, avgEnergy=.02, torchSupported=false;
+  let flashTimer=null, flashInProgress=false;
 
-  function uiValues() {
-    sensValue.textContent = sensitivity.value + '%';
-    intervalValue.textContent = minInterval.value + ' ms';
-    flashValue.textContent = flashMs.value + ' ms';
+  function uiValues(){
+    sensValue.textContent=sensitivity.value+'%';
+    intervalValue.textContent=minInterval.value+' ms';
+    flashValue.textContent=flashMs.value+' ms';
   }
-  [sensitivity, minInterval, flashMs].forEach(el => el.addEventListener('input', uiValues));
-  uiValues();
+  [sensitivity,minInterval,flashMs].forEach(x=>x.addEventListener('input',uiValues)); uiValues();
+
+  async function openTorchCamera() {
+    // Permission first; then enumerate cameras. Samsung often exposes multiple rear lenses,
+    // and only one of them reports the torch capability.
+    let permissionStream = await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'}}, audio:false
+    });
+    permissionStream.getTracks().forEach(t=>t.stop());
+
+    const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput');
+    const rearFirst = [...devices].sort((a,b)=>{
+      const score = x => /back|rear|environment|tył|0/i.test(x.label) ? 1 : 0;
+      return score(b)-score(a);
+    });
+
+    let fallback=null;
+    for (const dev of rearFirst) {
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({
+          video:{
+            deviceId:{exact:dev.deviceId},
+            width:{ideal:640}, height:{ideal:480},
+            frameRate:{ideal:15,max:30}
+          }, audio:false
+        });
+        const t=s.getVideoTracks()[0];
+        const caps = typeof t.getCapabilities==='function' ? t.getCapabilities() : {};
+        if (caps && caps.torch === true) {
+          if (fallback) fallback.getTracks().forEach(x=>x.stop());
+          cameraStream=s; videoTrack=t; torchSupported=true;
+          torchInfo.textContent='Latarka: wykryta ('+(t.label||'tylna kamera')+')';
+          return;
+        }
+        if (!fallback) fallback=s; else s.getTracks().forEach(x=>x.stop());
+      } catch(e) {}
+    }
+
+    if (fallback) {
+      cameraStream=fallback; videoTrack=fallback.getVideoTracks()[0];
+      const caps = videoTrack?.getCapabilities?.() || {};
+      torchSupported = caps.torch === true;
+    }
+    torchInfo.textContent = torchSupported ? 'Latarka: wykryta' :
+      'Latarka: Chrome nie udostępnia LED — błysk ekranu';
+  }
 
   async function setTorch(on) {
-    if (!torchSupported || !videoTrack || torchBusy) return;
-    torchBusy = true;
+    if (!videoTrack || !torchSupported) return false;
     try {
-      await videoTrack.applyConstraints({ advanced: [{ torch: !!on }] });
-    } catch (e) {
-      torchSupported = false;
-      torchInfo.textContent = 'Latarka: brak sterowania — używam błysku ekranu';
-    } finally {
-      torchBusy = false;
+      // Direct constraint works on current Chromium; advanced is retained as fallback.
+      try { await videoTrack.applyConstraints({torch:!!on}); }
+      catch(e) { await videoTrack.applyConstraints({advanced:[{torch:!!on}]}); }
+      const settings = videoTrack.getSettings?.() || {};
+      if ('torch' in settings && settings.torch !== !!on) throw new Error('torch state rejected');
+      return true;
+    } catch(e) {
+      torchSupported=false;
+      torchInfo.textContent='Latarka: sterowanie LED odrzucone przez Chrome';
+      return false;
     }
   }
 
   async function flash() {
+    if (flashInProgress) return;
+    flashInProgress=true;
     beatDot.classList.add('beat');
-    setTimeout(() => beatDot.classList.remove('beat'), 70);
+    setTimeout(()=>beatDot.classList.remove('beat'),70);
+    const ms=Number(flashMs.value);
 
-    const ms = Number(flashMs.value);
     if (torchSupported) {
-      await setTorch(true);
-      setTimeout(() => setTorch(false), ms);
-    } else {
-      document.body.classList.add('screen-flash');
-      setTimeout(() => document.body.classList.remove('screen-flash'), ms);
-    }
-  }
-
-  function detectBeat() {
-    if (!running) return;
-    const data = new Uint8Array(analyser.fftSize);
-    analyser.getByteTimeDomainData(data);
-
-    let sum = 0;
-    for (let i = 0; i < data.length; i++) {
-      const x = (data[i] - 128) / 128;
-      sum += x * x;
-    }
-    const rms = Math.sqrt(sum / data.length);
-    avgEnergy = avgEnergy * 0.94 + rms * 0.06;
-
-    const sens = Number(sensitivity.value) / 100;
-    // Wyższa czułość = niższy próg.
-    const ratioThreshold = 2.15 - sens * 0.95; // ~2.14 -> 1.20
-    const absoluteFloor = 0.025 - sens * 0.015;
-    const now = performance.now();
-
-    peakHold = Math.max(rms, peakHold * 0.94);
-    meterBar.style.width = Math.min(100, rms * 380) + '%';
-
-    if (rms > Math.max(absoluteFloor, avgEnergy * ratioThreshold) &&
-        now - lastBeat >= Number(minInterval.value)) {
-      lastBeat = now;
-      flash();
-    }
-
-    rafId = requestAnimationFrame(detectBeat);
-  }
-
-  async function start() {
-    if (running) return;
-    statusText.innerHTML = '<b>Uruchamianie…</b>';
-    try {
-      // Jednocześnie prosimy o mikrofon i tylną kamerę.
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false
-        },
-        video: { facingMode: { ideal: 'environment' } }
-      });
-
-      const audioTracks = stream.getAudioTracks();
-      const videoTracks = stream.getVideoTracks();
-      if (!audioTracks.length) throw new Error('Brak ścieżki mikrofonu');
-
-      videoTrack = videoTracks[0] || null;
-      if (videoTrack && typeof videoTrack.getCapabilities === 'function') {
-        const caps = videoTrack.getCapabilities();
-        torchSupported = !!caps.torch;
+      const ok=await setTorch(true);
+      if (ok) {
+        clearTimeout(flashTimer);
+        flashTimer=setTimeout(async()=>{ await setTorch(false); flashInProgress=false; },ms);
+        return;
       }
+    }
+    document.body.classList.add('screen-flash');
+    flashTimer=setTimeout(()=>{document.body.classList.remove('screen-flash');flashInProgress=false;},ms);
+  }
 
-      torchInfo.textContent = torchSupported
-        ? 'Latarka: obsługiwana'
-        : 'Latarka: brak sterowania — używam błysku ekranu';
+  function detectBeat(){
+    if(!running)return;
+    const data=new Uint8Array(analyser.fftSize); analyser.getByteTimeDomainData(data);
+    let sum=0; for(let i=0;i<data.length;i++){const x=(data[i]-128)/128;sum+=x*x}
+    const rms=Math.sqrt(sum/data.length);
+    avgEnergy=avgEnergy*.94+rms*.06;
+    const sens=Number(sensitivity.value)/100;
+    const ratioThreshold=2.15-sens*.95, absoluteFloor=.025-sens*.015, now=performance.now();
+    meterBar.style.width=Math.min(100,rms*380)+'%';
+    if(rms>Math.max(absoluteFloor,avgEnergy*ratioThreshold)&&now-lastBeat>=Number(minInterval.value)){
+      lastBeat=now; flash();
+    }
+    rafId=requestAnimationFrame(detectBeat);
+  }
 
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      await audioCtx.resume();
-      source = audioCtx.createMediaStreamSource(new MediaStream(audioTracks));
+  async function start(){
+    if(running)return;
+    statusText.innerHTML='<b>Uruchamianie…</b>';
+    try{
+      audioStream=await navigator.mediaDevices.getUserMedia({
+        audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false
+      });
+      await openTorchCamera();
 
-      // Low-pass sprawia, że detektor jest bardziej czuły na stopę/bas.
-      const lowpass = audioCtx.createBiquadFilter();
-      lowpass.type = 'lowpass';
-      lowpass.frequency.value = 180;
-      lowpass.Q.value = 0.7;
+      audioCtx=new (window.AudioContext||window.webkitAudioContext)(); await audioCtx.resume();
+      source=audioCtx.createMediaStreamSource(audioStream);
+      const lowpass=audioCtx.createBiquadFilter(); lowpass.type='lowpass'; lowpass.frequency.value=180; lowpass.Q.value=.7;
+      analyser=audioCtx.createAnalyser(); analyser.fftSize=1024; analyser.smoothingTimeConstant=.15;
+      source.connect(lowpass); lowpass.connect(analyser);
 
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.15;
+      // Test the physical LED once at START. This immediately tells us whether Chrome accepted it.
+      if(torchSupported){ await setTorch(true); await new Promise(r=>setTimeout(r,180)); await setTorch(false); }
 
-      source.connect(lowpass);
-      lowpass.connect(analyser);
-
-      avgEnergy = 0.02;
-      lastBeat = 0;
-      running = true;
-      startBtn.disabled = true;
-      stopBtn.disabled = false;
-      statusText.innerHTML = '<b>Nasłuchuję rytmu</b>';
-      detectBeat();
-    } catch (e) {
-      console.error(e);
-      statusText.innerHTML = '<b>Nie udało się uruchomić</b>';
-      torchInfo.textContent = 'Sprawdź zgodę na mikrofon i kamerę oraz użyj HTTPS.';
-      stop();
+      avgEnergy=.02;lastBeat=0;running=true;startBtn.disabled=true;stopBtn.disabled=false;
+      statusText.innerHTML='<b>Nasłuchuję rytmu</b>'; detectBeat();
+    }catch(e){
+      console.error(e); statusText.innerHTML='<b>Nie udało się uruchomić</b>';
+      torchInfo.textContent='Sprawdź zgody na mikrofon i kamerę.'; stop(false);
     }
   }
 
-  function stop() {
-    running = false;
-    if (rafId) cancelAnimationFrame(rafId);
-    rafId = null;
-    if (videoTrack && torchSupported) {
-      try { videoTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch {}
-    }
-    if (stream) stream.getTracks().forEach(t => t.stop());
-    stream = null;
-    videoTrack = null;
-    torchSupported = false;
-    if (audioCtx) {
-      try { audioCtx.close(); } catch {}
-    }
-    audioCtx = null;
-    analyser = null;
-    source = null;
-    document.body.classList.remove('screen-flash');
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
-    meterBar.style.width = '0%';
-    if (statusText.textContent !== 'Nie udało się uruchomić') {
-      statusText.innerHTML = '<b>Zatrzymano</b>';
-      torchInfo.textContent = 'Latarka: jeszcze niesprawdzona';
-    }
+  async function stop(setText=true){
+    running=false;if(rafId)cancelAnimationFrame(rafId);rafId=null;clearTimeout(flashTimer);
+    if(videoTrack&&torchSupported){try{await setTorch(false)}catch{}}
+    [audioStream,cameraStream].forEach(s=>s?.getTracks().forEach(t=>t.stop()));
+    audioStream=cameraStream=null;videoTrack=null;torchSupported=false;
+    if(audioCtx){try{await audioCtx.close()}catch{}} audioCtx=analyser=source=null;
+    document.body.classList.remove('screen-flash');flashInProgress=false;
+    startBtn.disabled=false;stopBtn.disabled=true;meterBar.style.width='0%';
+    if(setText){statusText.innerHTML='<b>Zatrzymano</b>';torchInfo.textContent='Latarka: jeszcze niesprawdzona'}
   }
 
-  startBtn.addEventListener('click', start);
-  stopBtn.addEventListener('click', stop);
-
-  if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(()=>{}));
+  startBtn.addEventListener('click',start); stopBtn.addEventListener('click',()=>stop(true));
+  if('serviceWorker'in navigator){
+    navigator.serviceWorker.getRegistrations().then(rs=>rs.forEach(r=>r.unregister())).catch(()=>{});
   }
 })();
 </script>

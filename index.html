@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#090b10" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <title>BeatFlash</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, -apple-system, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; background:#090b10; color:#f5f7fb; display:grid; place-items:center; padding:20px; }
+    .card { width:min(560px,100%); background:#131722; border:1px solid #2a3140; border-radius:24px; padding:22px; box-shadow:0 20px 60px rgba(0,0,0,.35); }
+    h1 { margin:0 0 6px; font-size:32px; }
+    .sub { color:#aeb7c7; margin:0 0 22px; }
+    .status { display:flex; align-items:center; gap:10px; padding:12px 14px; background:#0d1119; border-radius:14px; margin-bottom:18px; }
+    .dot { width:12px; height:12px; border-radius:50%; background:#6b7280; transition:.08s; }
+    .dot.beat { background:#fff; box-shadow:0 0 22px #fff; transform:scale(1.5); }
+    .row { margin:18px 0; }
+    label { display:flex; justify-content:space-between; gap:12px; margin-bottom:8px; font-weight:600; }
+    input[type=range] { width:100%; }
+    .buttons { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:22px; }
+    button { border:0; border-radius:16px; padding:15px 16px; font-size:17px; font-weight:700; background:#f2f4f8; color:#0b0d11; }
+    button.secondary { background:#252c3a; color:#f5f7fb; }
+    button:disabled { opacity:.45; }
+    .meter { height:10px; background:#202633; border-radius:999px; overflow:hidden; margin-top:10px; }
+    .meter > div { height:100%; width:0%; background:#e8edf7; transition:width .04s linear; }
+    .small { font-size:13px; color:#9aa5b5; line-height:1.45; margin-top:18px; }
+    .warning { font-size:13px; color:#c6cbd4; background:#171c27; border-radius:12px; padding:11px 12px; margin-top:14px; }
+    body.screen-flash { background:white; }
+    body.screen-flash .card { opacity:.05; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>BeatFlash</h1>
+    <p class="sub">Latarka w rytm muzyki</p>
+
+    <div class="status">
+      <div id="beatDot" class="dot"></div>
+      <div>
+        <div id="statusText"><b>Gotowy</b></div>
+        <div id="torchInfo" style="font-size:13px;color:#9aa5b5">Latarka: jeszcze niesprawdzona</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label><span>Czułość</span><span id="sensValue">65%</span></label>
+      <input id="sensitivity" type="range" min="1" max="100" value="65">
+      <div class="meter"><div id="meterBar"></div></div>
+    </div>
+
+    <div class="row">
+      <label><span>Minimalny odstęp między błyskami</span><span id="intervalValue">220 ms</span></label>
+      <input id="minInterval" type="range" min="100" max="700" step="10" value="220">
+    </div>
+
+    <div class="row">
+      <label><span>Długość błysku</span><span id="flashValue">55 ms</span></label>
+      <input id="flashMs" type="range" min="20" max="180" step="5" value="55">
+    </div>
+
+    <div class="buttons">
+      <button id="startBtn">START</button>
+      <button id="stopBtn" class="secondary" disabled>STOP</button>
+    </div>
+
+    <p class="small">
+      Najlepiej działa w Chrome na Androidzie. Telefon musi pozwalać stronie na mikrofon i tylną kamerę.
+      Kamera jest używana tylko po to, żeby uzyskać dostęp do latarki — obraz nie jest zapisywany ani wysyłany.
+    </p>
+    <div class="warning">
+      Uwaga: intensywne światło stroboskopowe może wywołać objawy u osób z nadwrażliwością na migające światło.
+      Nie kieruj go w oczy i nie używaj przy osobach z padaczką fotowrażliwą.
+    </div>
+  </main>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const sensitivity = $('sensitivity');
+  const minInterval = $('minInterval');
+  const flashMs = $('flashMs');
+  const sensValue = $('sensValue');
+  const intervalValue = $('intervalValue');
+  const flashValue = $('flashValue');
+  const startBtn = $('startBtn');
+  const stopBtn = $('stopBtn');
+  const statusText = $('statusText');
+  const torchInfo = $('torchInfo');
+  const beatDot = $('beatDot');
+  const meterBar = $('meterBar');
+
+  let audioCtx, analyser, source, stream;
+  let videoTrack = null;
+  let torchSupported = false;
+  let running = false;
+  let rafId = null;
+  let lastBeat = 0;
+  let avgEnergy = 0.02;
+  let peakHold = 0;
+  let torchBusy = false;
+
+  function uiValues() {
+    sensValue.textContent = sensitivity.value + '%';
+    intervalValue.textContent = minInterval.value + ' ms';
+    flashValue.textContent = flashMs.value + ' ms';
+  }
+  [sensitivity, minInterval, flashMs].forEach(el => el.addEventListener('input', uiValues));
+  uiValues();
+
+  async function setTorch(on) {
+    if (!torchSupported || !videoTrack || torchBusy) return;
+    torchBusy = true;
+    try {
+      await videoTrack.applyConstraints({ advanced: [{ torch: !!on }] });
+    } catch (e) {
+      torchSupported = false;
+      torchInfo.textContent = 'Latarka: brak sterowania — używam błysku ekranu';
+    } finally {
+      torchBusy = false;
+    }
+  }
+
+  async function flash() {
+    beatDot.classList.add('beat');
+    setTimeout(() => beatDot.classList.remove('beat'), 70);
+
+    const ms = Number(flashMs.value);
+    if (torchSupported) {
+      await setTorch(true);
+      setTimeout(() => setTorch(false), ms);
+    } else {
+      document.body.classList.add('screen-flash');
+      setTimeout(() => document.body.classList.remove('screen-flash'), ms);
+    }
+  }
+
+  function detectBeat() {
+    if (!running) return;
+    const data = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(data);
+
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) {
+      const x = (data[i] - 128) / 128;
+      sum += x * x;
+    }
+    const rms = Math.sqrt(sum / data.length);
+    avgEnergy = avgEnergy * 0.94 + rms * 0.06;
+
+    const sens = Number(sensitivity.value) / 100;
+    // Wyższa czułość = niższy próg.
+    const ratioThreshold = 2.15 - sens * 0.95; // ~2.14 -> 1.20
+    const absoluteFloor = 0.025 - sens * 0.015;
+    const now = performance.now();
+
+    peakHold = Math.max(rms, peakHold * 0.94);
+    meterBar.style.width = Math.min(100, rms * 380) + '%';
+
+    if (rms > Math.max(absoluteFloor, avgEnergy * ratioThreshold) &&
+        now - lastBeat >= Number(minInterval.value)) {
+      lastBeat = now;
+      flash();
+    }
+
+    rafId = requestAnimationFrame(detectBeat);
+  }
+
+  async function start() {
+    if (running) return;
+    statusText.innerHTML = '<b>Uruchamianie…</b>';
+    try {
+      // Jednocześnie prosimy o mikrofon i tylną kamerę.
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        },
+        video: { facingMode: { ideal: 'environment' } }
+      });
+
+      const audioTracks = stream.getAudioTracks();
+      const videoTracks = stream.getVideoTracks();
+      if (!audioTracks.length) throw new Error('Brak ścieżki mikrofonu');
+
+      videoTrack = videoTracks[0] || null;
+      if (videoTrack && typeof videoTrack.getCapabilities === 'function') {
+        const caps = videoTrack.getCapabilities();
+        torchSupported = !!caps.torch;
+      }
+
+      torchInfo.textContent = torchSupported
+        ? 'Latarka: obsługiwana'
+        : 'Latarka: brak sterowania — używam błysku ekranu';
+
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      await audioCtx.resume();
+      source = audioCtx.createMediaStreamSource(new MediaStream(audioTracks));
+
+      // Low-pass sprawia, że detektor jest bardziej czuły na stopę/bas.
+      const lowpass = audioCtx.createBiquadFilter();
+      lowpass.type = 'lowpass';
+      lowpass.frequency.value = 180;
+      lowpass.Q.value = 0.7;
+
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.15;
+
+      source.connect(lowpass);
+      lowpass.connect(analyser);
+
+      avgEnergy = 0.02;
+      lastBeat = 0;
+      running = true;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      statusText.innerHTML = '<b>Nasłuchuję rytmu</b>';
+      detectBeat();
+    } catch (e) {
+      console.error(e);
+      statusText.innerHTML = '<b>Nie udało się uruchomić</b>';
+      torchInfo.textContent = 'Sprawdź zgodę na mikrofon i kamerę oraz użyj HTTPS.';
+      stop();
+    }
+  }
+
+  function stop() {
+    running = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    if (videoTrack && torchSupported) {
+      try { videoTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch {}
+    }
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null;
+    videoTrack = null;
+    torchSupported = false;
+    if (audioCtx) {
+      try { audioCtx.close(); } catch {}
+    }
+    audioCtx = null;
+    analyser = null;
+    source = null;
+    document.body.classList.remove('screen-flash');
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    meterBar.style.width = '0%';
+    if (statusText.textContent !== 'Nie udało się uruchomić') {
+      statusText.innerHTML = '<b>Zatrzymano</b>';
+      torchInfo.textContent = 'Latarka: jeszcze niesprawdzona';
+    }
+  }
+
+  startBtn.addEventListener('click', start);
+  stopBtn.addEventListener('click', stop);
+
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(()=>{}));
+  }
+})();
+</script>
+</body>
+</html>

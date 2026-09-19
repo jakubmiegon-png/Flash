@@ -1,0 +1,20 @@
+BEATFLASH — GITHUB PAGES
+
+1. Wejdź do repozytorium BeatFlash na GitHubie.
+2. Wybierz Add file -> Upload files.
+3. Wgraj do GŁÓWNEGO katalogu repozytorium:
+   - index.html
+   - manifest.webmanifest
+   - sw.js
+   - .nojekyll
+4. Zatwierdź: Commit changes.
+5. Wejdź: Settings -> Pages.
+6. W "Build and deployment":
+   Source: Deploy from a branch
+   Branch: main
+   Folder: /(root)
+   Save.
+7. Po chwili aplikacja będzie pod adresem:
+   https://jakubmiegon-png.github.io/BeatFlash/
+
+Otwórz ten adres w Chrome na Androidzie i przy pierwszym START zezwól na mikrofon i kamerę.
